@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -19,6 +20,12 @@ const MaxFileSizeInBytes = 65536
 type Rule struct {
 	// From is the path which is matched to perform the rule.
 	From string
+
+	// FromQuery is the set of required query parameters which
+	// must be present to perform the rule.
+	// A string without a preceding colon requires that query parameter is this exact value.
+	// A string with a preceding colon will match any value, and provide it as a placeholder.
+	FromQuery map[string]string
 
 	// To is the destination which may be relative, or absolute
 	// in order to proxy the request to another URL.
@@ -50,37 +57,70 @@ func (r *Rule) IsProxy() bool {
 
 // MatchAndExpandPlaceholders expands placeholders in `r.To` and returns true if the provided path matches.
 // Otherwise it returns false.
-func (r *Rule) MatchAndExpandPlaceholders(urlPath string) bool {
+func (r *Rule) MatchAndExpandPlaceholders(urlPath string, urlParams url.Values) bool {
 	// get rule.From, trim trailing slash, ...
 	fromPath := urlpath.New(strings.TrimSuffix(r.From, "/"))
 	match, ok := fromPath.Match(urlPath)
-
 	if !ok {
 		return false
 	}
 
-	// We have a match!  Perform substitution and return the updated rule
+	placeholders := match.Params
+	placeholders["splat"] = match.Trailing
+	if !matchParams(r.FromQuery, urlParams, placeholders) {
+		return false
+	}
+
+	// We have a match! Perform substitution and return the updated rule
 	toPath := r.To
-	toPath = replacePlaceholders(toPath, match)
-	toPath = replaceSplat(toPath, match)
+	toPath = replacePlaceholders(toPath, placeholders)
+
+	// There's a placeholder unsupplied somewhere
+	if strings.Contains(toPath, ":") {
+		return false
+	}
 
 	r.To = toPath
 
 	return true
 }
 
-func replacePlaceholders(to string, match urlpath.Match) string {
-	if len(match.Params) > 0 {
-		for key, value := range match.Params {
-			to = strings.ReplaceAll(to, ":"+key, value)
-		}
+func replacePlaceholders(to string, placeholders map[string]string) string {
+	if len(placeholders) == 0 {
+		return to
+	}
+
+	for key, value := range placeholders {
+		to = strings.ReplaceAll(to, ":"+key, value)
 	}
 
 	return to
 }
 
-func replaceSplat(to string, match urlpath.Match) string {
-	return strings.ReplaceAll(to, ":splat", match.Trailing)
+func replaceSplat(to string, splat string) string {
+	return strings.ReplaceAll(to, ":splat", splat)
+}
+
+func matchParams(fromQuery map[string]string, urlParams url.Values, placeholders map[string]string) bool {
+	for neededK, neededV := range fromQuery {
+		haveVs, ok := urlParams[neededK]
+		if !ok {
+			return false
+		}
+
+		if isPlaceholder(neededV) {
+			if _, ok := placeholders[neededV[1:]]; !ok {
+				placeholders[neededV[1:]] = haveVs[0]
+			}
+			continue
+		}
+
+		if !contains(haveVs, neededV) {
+			return false
+		}
+	}
+
+	return true
 }
 
 // Must parse utility.
@@ -123,10 +163,6 @@ func Parse(r io.Reader) (rules []Rule, err error) {
 			return nil, fmt.Errorf("missing 'to' path")
 		}
 
-		if len(fields) > 3 {
-			return nil, fmt.Errorf("must match format 'from to [status]'")
-		}
-
 		// implicit status
 		rule := Rule{Status: 301}
 
@@ -137,21 +173,40 @@ func Parse(r io.Reader) (rules []Rule, err error) {
 		}
 		rule.From = from
 
+		hasStatus := isLikelyStatusCode(fields[len(fields)-1])
+		toIndex := len(fields) - 1
+		if hasStatus {
+			toIndex = len(fields) - 2
+		}
+
 		// to (must parse as an absolute path or an URL)
-		to, err := parseTo(fields[1])
+		to, err := parseTo(fields[toIndex])
 		if err != nil {
 			return nil, fmt.Errorf("parsing 'to': %w", err)
 		}
 		rule.To = to
 
 		// status
-		if len(fields) > 2 {
-			code, err := parseStatus(fields[2])
+		if hasStatus {
+			code, err := parseStatus(fields[len(fields)-1])
 			if err != nil {
 				return nil, fmt.Errorf("parsing status %q: %w", fields[2], err)
 			}
 
 			rule.Status = code
+		}
+
+		// from query
+		if toIndex > 1 {
+			rule.FromQuery = make(map[string]string)
+
+			for i := 1; i < toIndex; i++ {
+				key, value, err := parseFromQuery(fields[i])
+				if err != nil {
+					return nil, errors.Wrapf(err, "parsing 'fromQuery'")
+				}
+				rule.FromQuery[key] = value
+			}
 		}
 
 		rules = append(rules, rule)
@@ -193,6 +248,46 @@ func parseFrom(s string) (string, error) {
 	return s, nil
 }
 
+func parseFromQuery(s string) (string, string, error) {
+	params, err := url.ParseQuery(s)
+	if err != nil {
+		return "", "", err
+	}
+	if len(params) != 1 {
+		return "", "", fmt.Errorf("separate different fromQuery arguments with a space")
+	}
+
+	var key string
+	var val []string
+	// We know there's only 1, but we don't know the key to access it
+	for k, v := range params {
+		key = k
+		val = v
+	}
+
+	if url.QueryEscape(key) != key {
+		return "", "", fmt.Errorf("fromQuery key must be URL encoded")
+	}
+
+	if len(val) > 1 {
+		return "", "", fmt.Errorf("separate different fromQuery arguments with a space")
+	}
+
+	ignorePlaceholders := val[0]
+	if isPlaceholder(val[0]) {
+		ignorePlaceholders = ignorePlaceholders[1:]
+	}
+
+	if url.QueryEscape(ignorePlaceholders) != ignorePlaceholders {
+		return "", "", fmt.Errorf("fromQuery val must be URL encoded")
+	}
+	return key, val[0], nil
+}
+
+func isPlaceholder(s string) bool {
+	return strings.HasPrefix(s, ":")
+}
+
 func parseTo(s string) (string, error) {
 	// confirm value is within URL path spec
 	u, err := url.Parse(s)
@@ -208,6 +303,13 @@ func parseTo(s string) (string, error) {
 	}
 
 	return s, nil
+}
+
+var likeStatusCode = regexp.MustCompile(`^\d{1,3}!?$`)
+
+// isLikelyStatusCode returns true if the given string is likely to be a status code.
+func isLikelyStatusCode(s string) bool {
+	return likeStatusCode.MatchString(s)
 }
 
 // parseStatus returns the status code.
@@ -233,6 +335,15 @@ func isValidStatusCode(status int) bool {
 	switch status {
 	case 200, 301, 302, 303, 307, 308, 404, 410, 451:
 		return true
+	}
+	return false
+}
+
+func contains(arr []string, s string) bool {
+	for _, a := range arr {
+		if a == s {
+			return true
+		}
 	}
 	return false
 }

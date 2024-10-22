@@ -7,10 +7,10 @@ This is a parser for the IPFS Web Gateway's `_redirects` file format.
 Follow specification work at https://github.com/ipfs/specs/pull/290
 
 ## Format
-Currently only supports `from`, `to` and `status`.
+Currently only supports `from`, `fromQuery`, `to` and `status`.
 
 ```
-from to [status]
+from [fromQuery [fromQuery]] to [status]
 ```
 
 ## Example
@@ -39,6 +39,10 @@ from to [status]
 
 # Single page app rewrite (SPA, PWA)
 /*    /index.html   200
+
+# Query parameter rewrite
+/thing  type=:type   /thing-:type.html 200
+/thing               /things.html 200
 ```
 
 ## Notes for contributors

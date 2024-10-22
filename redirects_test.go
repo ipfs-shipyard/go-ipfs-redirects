@@ -98,6 +98,28 @@ func TestParse(t *testing.T) {
 		require.Error(t, err)
 		require.ErrorContains(t, err, "redirects file size cannot exceed")
 	})
+
+	t.Run("with fromQuery arguments", func(t *testing.T) {
+		rules, err := ParseString(`
+		/fixed type=type /type.html
+		/dynamic type=:type /type-:type.html
+		/empty type= /empty-type.html
+		/any type=:ignore /any-type.html
+		/multi a=a b=:b c= d /multi-:b.html
+		/fixed200 type=type /type.html 200
+		/dynamic200 type=:type /type-:type.html 200
+		/empty200 type= /empty-type.html 200
+		/any200 type=:ignore /any-type.html 200
+		/multi200 a=a b=:b c= d /multi-:b.html 200
+		`)
+
+		assert.NoError(t, err)
+		assert.Len(t, rules, 10)
+		assert.Equal(t, "type", rules[0].FromQuery["type"])
+		assert.Equal(t, ":type", rules[1].FromQuery["type"])
+		assert.Equal(t, "", rules[2].FromQuery["type"])
+		assert.Equal(t, ":ignore", rules[3].FromQuery["type"])
+	})
 }
 
 func FuzzParse(f *testing.F) {
@@ -108,7 +130,12 @@ func FuzzParse(f *testing.F) {
 		"/%C4%85 /ę 301\n",
 		"#/a \n\n/b",
 		"/a200 /b200 200\n/a301 /b301 301\n/a302 /b302 302\n/a303 /b303 303\n/a307 /b307 307\n/a308 /b308 308\n/a404 /b404 404\n/a410 /b410 410\n/a451 /b451 451\n",
-		"hello\n", "/redirect-one /one.html\r\n/200-index /index.html 200\r\n", "a b 2\nc   d 42", "/a/*/b blah", "/from https://example.com 200\n/a/:blah/yeah /b/:blah/yeah"}
+		"hello\n", "/redirect-one /one.html\r\n/200-index /index.html 200\r\n", "a b 2\nc   d 42", "/a/*/b blah", "/from https://example.com 200\n/a/:blah/yeah /b/:blah/yeah",
+		"/fixed-val val=val /to\n", "/dynamic-val val=:val /to/:val\n", "/empty-val val= /to\n", "/any-val val /to\n",
+		"/fixed-val val=val /to 200\n/dynamic-val val=:val /to/:val 301\n/empty-val val= /to 404\n/any-val val /to 302\n",
+		"/multi-query val1=val1 val2=:val2 val3= val4 /to/:val2\n/multi-query2 val1=val1 val2=:val2 val3= val4 /to/:val2 302\n",
+		"/bad-syntax1 val=a&val=b /to\n", "/bad-syntax2 val=a&val2=b /to 302\n", "/a ^&notparams /b\n", "/bad-status type=:type /to 3oo\n", "/bad-chars :type=whatever /to\n", "/bad-chars type=what:ever /to\n",
+	}
 	for _, tc := range testcases {
 		f.Add([]byte(tc))
 	}
@@ -154,6 +181,21 @@ func FuzzParse(f *testing.F) {
 					t.Errorf("should error for 'to' URL with scheme other than safelisted ones: url=%q, scheme=%q, orig=%q", to, to.Scheme, orig)
 				}
 			}
+
+			for key, val := range r.FromQuery {
+				if url.QueryEscape(key) != key {
+					t.Errorf("should error for 'fromQuery' keys being unacceptable URL characters.  orig=%q", orig)
+				}
+
+				// Colons should only be present in values right at the start (they're invalid characters otherwise).
+				if len(val) > 0 && val[0] == ':' {
+					val = val[1:]
+				}
+
+				if url.QueryEscape(val) != val {
+					t.Errorf("should error for 'fromQuery' values containing unacceptable URL characters.  orig=%q", orig)
+				}
+			}
 		}
 
 		s := bufio.NewScanner(bytes.NewReader(orig))
@@ -169,11 +211,6 @@ func FuzzParse(f *testing.F) {
 
 			if len(fields) < 2 && line != "" {
 				t.Errorf("should error with less than 2 fields.  orig=%q", orig)
-				continue
-			}
-
-			if len(fields) > 3 {
-				t.Errorf("should error with more than 3 fields.  orig=%q", orig)
 				continue
 			}
 
@@ -194,4 +231,247 @@ func FuzzParse(f *testing.F) {
 
 		}
 	})
+}
+
+func TestMatchAndExpandPlaceholders(t *testing.T) {
+	testcases := []struct {
+		name       string
+		rule       *Rule
+		inPath     string
+		inParams   string
+		success    bool
+		expectedTo string
+	}{
+		{
+			name: "No expansion",
+			rule: &Rule{
+				From: "/from",
+				To:   "/to",
+			},
+			inPath:     "/from",
+			inParams:   "",
+			success:    true,
+			expectedTo: "/to",
+		},
+		{
+			name: "No expansion, but trailing slash",
+			rule: &Rule{
+				From: "/from/",
+				To:   "/to",
+			},
+			inPath:     "/from",
+			inParams:   "",
+			success:    true,
+			expectedTo: "/to",
+		},
+		{
+			name: "Splat matching",
+			rule: &Rule{
+				From: "/*",
+				To:   "/to",
+			},
+			inPath:     "/from",
+			inParams:   "",
+			success:    true,
+			expectedTo: "/to",
+		},
+		{
+			name: "Splat substitution",
+			rule: &Rule{
+				From: "/*",
+				To:   "/other/:splat",
+			},
+			inPath:     "/from",
+			inParams:   "",
+			success:    true,
+			expectedTo: "/other/from",
+		},
+		{
+			name: "Named substitution",
+			rule: &Rule{
+				From: "/:thing",
+				To:   "/:thing.html",
+			},
+			inPath:     "/from",
+			inParams:   "",
+			success:    true,
+			expectedTo: "/from.html",
+		},
+		{
+			name: "Missing placeholder",
+			rule: &Rule{
+				From: "/:this",
+				To:   "/:that.html",
+			},
+			inPath:   "/from",
+			inParams: "",
+			success:  false,
+		},
+		{
+			name: "Static query parameter, match",
+			rule: &Rule{
+				From: "/from",
+				FromQuery: map[string]string{
+					"a": "b",
+				},
+				To: "/to",
+			},
+			inPath:     "/from",
+			inParams:   "a=b",
+			success:    true,
+			expectedTo: "/to",
+		},
+		{
+			name: "Static query parameter, muli-match first",
+			rule: &Rule{
+				From: "/from",
+				FromQuery: map[string]string{
+					"a": "b",
+				},
+				To: "/to",
+			},
+			inPath:     "/from",
+			inParams:   "a=b&a=c",
+			success:    true,
+			expectedTo: "/to",
+		},
+		{
+			name: "Static query parameter, muli-match second",
+			rule: &Rule{
+				From: "/from",
+				FromQuery: map[string]string{
+					"a": "b",
+				},
+				To: "/to",
+			},
+			inPath:     "/from",
+			inParams:   "a=c&a=b",
+			success:    true,
+			expectedTo: "/to",
+		},
+		{
+			name: "Static query parameter, no match",
+			rule: &Rule{
+				From: "/from",
+				FromQuery: map[string]string{
+					"a": "b",
+				},
+				To: "/to",
+			},
+			inPath:   "/from",
+			inParams: "",
+			success:  false,
+		},
+		{
+			name: "Dynamic query parameter, match",
+			rule: &Rule{
+				From: "/from",
+				FromQuery: map[string]string{
+					"a": ":a",
+				},
+				To: "/to/:a.html",
+			},
+			inPath:     "/from",
+			inParams:   "a=b",
+			success:    true,
+			expectedTo: "/to/b.html",
+		},
+		{
+			name: "Dynamic query parameter, multi-match",
+			rule: &Rule{
+				From: "/from",
+				FromQuery: map[string]string{
+					"a": ":a",
+				},
+				To: "/:a.html",
+			},
+			inPath:     "/from",
+			inParams:   "a=b&a=c",
+			success:    true,
+			expectedTo: "/b.html",
+		},
+		{
+			name: "Dynamic query parameter, no match",
+			rule: &Rule{
+				From: "/from",
+				FromQuery: map[string]string{
+					"a": "b",
+				},
+				To: "/to",
+			},
+			inPath:   "/from",
+			inParams: "",
+			success:  false,
+		},
+		{
+			name: "Repeated placeholder in path",
+			rule: &Rule{
+				From: "/:from/:from",
+				To:   "/:from.html",
+			},
+			inPath:     "/a/b",
+			inParams:   "",
+			success:    true,
+			expectedTo: "/b.html",
+		},
+		{
+			name: "Repeated placeholder in params",
+			rule: &Rule{
+				From: "/from",
+				FromQuery: map[string]string{
+					"q": ":val",
+					"r": ":val",
+				},
+				To: "/:val.html",
+			},
+			inPath:     "/from",
+			inParams:   "q=qq&r=rr",
+			success:    true,
+			expectedTo: "/qq.html",
+		},
+		{
+			name: "Repeated placeholder in path then params",
+			rule: &Rule{
+				From: "/:val",
+				FromQuery: map[string]string{
+					"q": ":val",
+				},
+				To: "/:val.html",
+			},
+			inPath:     "/path",
+			inParams:   "q=query",
+			success:    true,
+			expectedTo: "/path.html",
+		},
+		{
+			name: "Repeated placeholder splat",
+			rule: &Rule{
+				From: "/*",
+				FromQuery: map[string]string{
+					"q": ":splat",
+				},
+				To: "/:splat.html",
+			},
+			inPath:     "/path",
+			inParams:   "q=query",
+			success:    true,
+			expectedTo: "/path.html",
+		},
+	}
+
+	for _, tc := range testcases {
+		t.Run(tc.name, func(t *testing.T) {
+			params, err := url.ParseQuery(tc.inParams)
+			if err != nil {
+				t.Errorf("Invalid inParams given (%s): %v", tc.inParams, err)
+			}
+
+			ok := tc.rule.MatchAndExpandPlaceholders(tc.inPath, params)
+			assert.Equal(t, tc.success, ok, "Expected success to be %v, but was %v", tc.success, ok)
+
+			if tc.success {
+				assert.Equal(t, tc.expectedTo, tc.rule.To, "Expected the To property to be changed to %q, but was %q", tc.expectedTo, tc.rule.To)
+			}
+		})
+	}
 }
